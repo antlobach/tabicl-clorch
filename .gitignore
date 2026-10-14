@@ -1,0 +1,7 @@
+.cpcache/
+.clj-kondo/.cache/
+.nrepl-port
+pom.xml
+*.safetensors
+*.ckpt
+.DS_Store
