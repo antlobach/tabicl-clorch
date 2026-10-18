@@ -111,6 +111,58 @@ quantiles, transformed back to the target scale:
 ;; => [predicted-mean-0 predicted-mean-1]
 ```
 
+### Use TabICL as a Metamorph model
+
+Requiring `tabicl.noj` registers `:tabicl/classifier` and
+`:tabicl/regressor` with `metamorph.ml`. They work with the ordinary
+`ml/model` pipeline step; fitted pipeline state retains the pretrained model
+and context table for subsequent transforms:
+
+```clojure
+(require '[scicloj.metamorph.core :as mm]
+         '[scicloj.metamorph.ml :as ml]
+         '[tabicl.noj]
+         '[tablecloth.api :as tc]
+         '[tech.v3.dataset.metamorph :as ds-mm])
+
+(def training-data
+  (tc/dataset {:x1 [0.1 0.8 -1.1 1.4]
+               :x2 [1.2 -0.4 0.3 0.9]
+               :label [0 1 0 1]}))
+
+(def pipeline
+  (mm/pipeline
+   (ds-mm/set-inference-target :label)
+   {:metamorph/id :tabicl}
+   (ml/model {:model-type :tabicl/classifier
+              :checkpoint "checkpoints/tabicl-classifier-v2.safetensors"
+              :device :cuda
+              :n-estimators 2})))
+
+(def fitted
+  (pipeline {:metamorph/data training-data
+             :metamorph/mode :fit}))
+
+(def predictions
+  (:metamorph/data
+   (pipeline (assoc fitted
+                    :metamorph/data
+                    (tc/dataset {:x1 [0.2 -0.9]
+                                 :x2 [0.7 0.1]
+                                 ;; The target column can be present during
+                                 ;; evaluation and is ignored for prediction.
+                                 :label [0 0]})
+                    :metamorph/mode :transform))))
+```
+
+`predictions` contains the predicted `:label` column, marked as
+`:prediction`, plus one probability-distribution column per observed class.
+Use `:model-type :tabicl/regressor` with the converted regressor checkpoint
+for regression pipelines. `:checkpoint` may be replaced with a preloaded
+`:model` to avoid repeated checkpoint loading. A preloaded model is mutable
+native state; do not use the same instance concurrently from multiple
+pipelines.
+
 ## TabICLv1 low-level model
 
 ```clojure
