@@ -5,3 +5,4 @@ pom.xml
 *.safetensors
 *.ckpt
 .DS_Store
+.firecrawl/

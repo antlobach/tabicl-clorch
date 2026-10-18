@@ -1,4 +1,7 @@
-(ns tabicl.v2.preprocessing)
+(ns tabicl.v2.preprocessing
+  (:require [scicloj.metamorph.core :as mm]
+            [scicloj.metamorph.ml.preprocessing :as preprocessing]
+            [tablecloth.api :as tc]))
 
 (set! *warn-on-reflection* true)
 
@@ -17,9 +20,6 @@
                0.0
                values)
        (double (max 1 divisor)))))
-
-(defn- clip [value lower upper]
-  (max lower (min upper value)))
 
 (defn- yeo-johnson [value lambda]
   (let [value (double value)
@@ -60,64 +60,110 @@
           (let [next-right (+ left (/ (- hi left) ratio))]
             (recur left hi right next-right (inc iteration))))))))
 
-(defn fit-preprocessor
-  "Fits TabICLv2's standardization, optional Yeo-Johnson transform, and outlier bounds."
-  [rows method outlier-threshold]
+(defn- rows->dataset [rows columns]
+  (tc/dataset rows {:layout :as-row :column-names columns}))
+
+(defn- dataset->rows [dataset]
+  (mapv (fn [row] (mapv double row))
+        (tc/rows dataset :as-vectors)))
+
+(defn- power-transform [rows lambdas]
+  (mapv #(mapv yeo-johnson % lambdas) rows))
+
+(defn- power-step [enabled? columns]
+  (fn [{:metamorph/keys [data id mode] :as context}]
+    (if-not enabled?
+      context
+      (case mode
+        :fit
+        (let [rows (dataset->rows data)
+              lambdas (mapv optimize-power (transpose rows))]
+          (assoc context
+                 id {:lambdas lambdas}
+                 :metamorph/data (rows->dataset (power-transform rows lambdas) columns)))
+
+        :transform
+        (let [lambdas (get-in context [id :lambdas])]
+          (assoc context :metamorph/data
+                 (rows->dataset (power-transform (dataset->rows data) lambdas)
+                                columns)))))))
+
+(defn- outlier-bounds [rows threshold]
   (let [columns (transpose rows)
-        means (mapv mean columns)
-        scales (mapv (fn [column center]
-                       (+ (Math/sqrt (variance column center false)) 1.0e-6))
-                     columns means)
-        standardized (mapv (fn [row]
-                             (mapv #(clip (/ (- (double %1) %2) %3) -100.0 100.0)
-                                   row means scales))
-                           rows)
-        lambdas (when (= method :power)
-                  (mapv optimize-power (transpose standardized)))
-        normalized (if lambdas
-                     (mapv #(mapv yeo-johnson % lambdas) standardized)
-                     standardized)
-        initial-columns (transpose normalized)
-        initial-means (mapv mean initial-columns)
+        initial-means (mapv mean columns)
         initial-stds (mapv (fn [column center]
                              (max 1.0e-6 (Math/sqrt (variance column center true))))
-                           initial-columns initial-means)
+                           columns initial-means)
         clean-columns (mapv (fn [column center std]
-                              (filterv #(<= (- center (* outlier-threshold std))
+                              (filterv #(<= (- center (* threshold std))
                                             %
-                                            (+ center (* outlier-threshold std)))
+                                            (+ center (* threshold std)))
                                        column))
-                            initial-columns initial-means initial-stds)
+                            columns initial-means initial-stds)
         clean-means (mapv mean clean-columns)
         clean-stds (mapv (fn [column center]
                            (max 1.0e-6 (Math/sqrt (variance column center true))))
                          clean-columns clean-means)]
-    {:method method
-     :means means
-     :scales scales
-     :lambdas lambdas
-     :lower (mapv #(- %1 (* outlier-threshold %2)) clean-means clean-stds)
-     :upper (mapv #(+ %1 (* outlier-threshold %2)) clean-means clean-stds)}))
+    {:lower (mapv #(- %1 (* threshold %2)) clean-means clean-stds)
+     :upper (mapv #(+ %1 (* threshold %2)) clean-means clean-stds)}))
+
+(defn- remove-outliers [rows lower upper]
+  (mapv (fn [row]
+          (mapv (fn [value lo hi]
+                  (let [value (double value)
+                        adjustment (Math/log1p (Math/abs value))]
+                    (-> value
+                        (max (- lo adjustment))
+                        (min (+ hi adjustment)))))
+                row lower upper))
+        rows))
+
+(defn- outlier-step [threshold columns]
+  (fn [{:metamorph/keys [data id mode] :as context}]
+    (case mode
+      :fit
+      (let [rows (dataset->rows data)
+            {:keys [lower upper] :as bounds} (outlier-bounds rows threshold)]
+        (assoc context
+               id bounds
+               :metamorph/data (rows->dataset (remove-outliers rows lower upper)
+                                              columns)))
+
+      :transform
+      (let [{:keys [lower upper]} (get context id)]
+        (assoc context :metamorph/data
+               (rows->dataset (remove-outliers (dataset->rows data) lower upper)
+                              columns))))))
+
+(defn fit-preprocessor
+  "Fits a Noj/Metamorph feature pipeline on context rows only.
+
+  The pipeline uses Noj standard scaling, optional Yeo-Johnson normalization,
+  and TabICLv2's soft outlier bounds. Its fitted context is reused for query
+  and inference transforms."
+  [rows method outlier-threshold]
+  (let [columns (vec (range (count (first rows))))
+        pipeline (mm/pipeline
+                  (preprocessing/std-scale columns {})
+                  (power-step (= method :power) columns)
+                  (outlier-step outlier-threshold columns))
+        fitted-context (pipeline {:metamorph/data (rows->dataset rows columns)
+                                  :metamorph/mode :fit})]
+    {:pipeline pipeline
+     :columns columns
+     :fitted-context (dissoc fitted-context :metamorph/data)}))
 
 (defn transform
-  "Applies a fitted TabICLv2 feature preprocessor."
-  [preprocessor rows]
-  (let [{:keys [means scales lambdas lower upper]} preprocessor]
-    (mapv (fn [row]
-            (mapv (fn [value center scale lambda lo hi]
-                    (let [standardized (clip (/ (- (double value) center) scale)
-                                             -100.0 100.0)
-                          normalized (double (if lambda
-                                               (yeo-johnson standardized lambda)
-                                               standardized))]
-                      (-> normalized
-                          (max (+ lo (- (Math/log1p (Math/abs normalized)))))
-                          (min (+ hi (Math/log1p (Math/abs normalized)))))))
-                  row means scales (or lambdas (repeat nil)) lower upper))
-          rows)))
+  "Applies a fitted Noj/Metamorph feature pipeline."
+  [{:keys [pipeline columns fitted-context]} rows]
+  (-> (pipeline (assoc fitted-context
+                       :metamorph/data (rows->dataset rows columns)
+                       :metamorph/mode :transform))
+      :metamorph/data
+      dataset->rows))
 
 (defn fit-ensemble
-  "Fits the per-estimator feature preprocessing and shuffle configuration used by TabICLv2."
+  "Fits per-estimator Noj preprocessing pipelines and shuffle configurations."
   [x-context y-context & {:keys [classification? n-estimators norm-methods outlier-threshold]
                           :or {classification? false
                                n-estimators 2

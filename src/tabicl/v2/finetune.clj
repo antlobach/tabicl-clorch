@@ -20,6 +20,8 @@
    :warmup-proportion 0.1
    :n-estimators 2
    :query-ratio 0.2
+   :max-data-size 10000
+   :min-chunk-size 50
    :patience 5
    :early-stopping? true
    :random-state 0
@@ -69,7 +71,8 @@
 (defn meta-batch
   "Builds one fresh context/query ensemble meta-batch from JVM feature rows."
   [x y classification? epoch options]
-  (let [{:keys [n-estimators query-ratio random-state norm-methods outlier-threshold]}
+  (let [{:keys [n-estimators query-ratio random-state split-seed
+                norm-methods outlier-threshold]}
         (merge default-options options)
         query-size (max 1 (long (* (count y) query-ratio)))
         [context-indices query-indices]
@@ -77,7 +80,7 @@
                            (max query-size (count (set y)))
                            query-size)
                        classification?
-                       (+ random-state epoch))
+                       (or split-seed (+ random-state epoch)))
         x-context (mapv x context-indices)
         x-query (mapv x query-indices)
         raw-y-context (mapv y context-indices)
@@ -114,6 +117,38 @@
      :train-size (count context-indices)
      :y-mean y-mean
      :y-std y-std}))
+
+(defn count-chunks
+  "Returns the number of fine-tuning chunks yielded per epoch."
+  [sample-count max-data-size min-chunk-size]
+  (cond
+    (not (pos? sample-count)) 0
+    (<= sample-count max-data-size) 1
+    :else (let [full (quot sample-count max-data-size)
+                remainder (mod sample-count max-data-size)]
+            (+ full (if (>= remainder min-chunk-size) 1 0)))))
+
+(defn epoch-meta-batches
+  "Builds freshly shuffled chunks and context/query splits for one epoch."
+  [x y classification? epoch options]
+  (let [{:keys [max-data-size min-chunk-size random-state]}
+        (merge default-options options)
+        indices (shuffled (range (count y)) (+ random-state epoch))
+        chunks (if (<= (count y) max-data-size)
+                 [indices]
+                 (->> indices
+                      (partition-all max-data-size)
+                      (filter #(>= (count %) min-chunk-size))))
+        indexed (map-indexed vector chunks)]
+    (mapv (fn [[chunk-index indices]]
+            (meta-batch (mapv x indices)
+                        (mapv y indices)
+                        classification?
+                        epoch
+                        (assoc options
+                               :split-seed (+ random-state epoch
+                                              (* chunk-index 7919)))))
+          indexed)))
 
 (defn classification-loss
   "Cross-entropy over active classes and all query/ensemble rows."
@@ -245,56 +280,71 @@
   rebuilds the official context/query ensemble meta-batch."
   [tabicl x-train y-train x-validation y-validation classification? & [options]]
   (let [{:keys [epochs learning-rate weight-decay grad-clip amp? warmup-proportion
-                patience early-stopping? device]
+                patience early-stopping? device max-data-size min-chunk-size]
          :as options} (merge default-options options)
         parameters (nn/parameters tabicl :trainable-only true)
         optimizer (optim/adamw parameters :lr learning-rate :weight-decay weight-decay)
         scaler (amp/grad-scaler {:enabled? (and amp? (= device :cuda))})
-        total-steps epochs
+        chunks-per-epoch (max 1 (count-chunks (count y-train)
+                                              max-data-size
+                                              min-chunk-size))
+        total-steps (* epochs chunks-per-epoch)
         warmup-steps (long (* total-steps warmup-proportion))
         baseline (validate tabicl x-train y-train x-validation y-validation classification? options)
         best-state (atom (nn/clone-flat-state-dict tabicl))
         best-metric (atom (:primary baseline))
         patience-counter (atom 0)
+        global-step (atom 0)
         history (atom [])
         maximize? classification?]
     (nn/train tabicl true)
     (loop [epoch 0]
       (when (and (< epoch epochs)
                  (or (not early-stopping?) (< @patience-counter patience)))
-        (let [batch (meta-batch x-train y-train classification? epoch options)
-              factor (cosine-warmup-factor epoch warmup-steps total-steps)]
-          (optim/set-learning-rate! optimizer (* learning-rate factor))
-          (optim/zero-grad optimizer)
-          (let [loss-value
-                (t/with-torch
-                  (let [loss (amp/call-with-autocast
-                              {:device device :dtype :float16 :enabled? (and amp? (= device :cuda))}
-                              #(if classification?
-                                 (classification-loss tabicl batch device)
-                                 (pinball-loss tabicl batch device)))]
-                    (amp/backward! scaler loss)
-                    (when (and grad-clip (pos? grad-clip) (amp/unscale! scaler optimizer))
-                      (nn/clip-grad-norm! parameters grad-clip))
-                    (amp/step! scaler optimizer)
-                    (t/item-float loss)))
-                metrics (validate tabicl x-train y-train x-validation y-validation
-                                  classification? options)
-                improved? (if maximize?
-                            (> (:primary metrics) @best-metric)
-                            (< (:primary metrics) @best-metric))]
-            (swap! history conj (assoc metrics
-                                       :epoch (inc epoch)
-                                       :train-loss loss-value
-                                       :learning-rate (first (optim/learning-rates optimizer))))
-            (if improved?
-              (do
-                (t/release! @best-state)
-                (reset! best-state (nn/clone-flat-state-dict tabicl))
-                (reset! best-metric (:primary metrics))
-                (reset! patience-counter 0))
-              (swap! patience-counter inc))
-            (recur (inc epoch))))))
+        (let [batches (epoch-meta-batches x-train y-train classification? epoch options)
+              losses
+              (mapv
+               (fn [batch]
+                 (let [factor (cosine-warmup-factor @global-step warmup-steps total-steps)]
+                   (optim/set-learning-rate! optimizer (* learning-rate factor))
+                   (optim/zero-grad optimizer)
+                   (let [loss-value
+                         (t/with-torch
+                           (let [loss (amp/call-with-autocast
+                                       {:device device
+                                        :dtype :float16
+                                        :enabled? (and amp? (= device :cuda))}
+                                       #(if classification?
+                                          (classification-loss tabicl batch device)
+                                          (pinball-loss tabicl batch device)))]
+                             (amp/backward! scaler loss)
+                             (when (and grad-clip
+                                        (pos? grad-clip)
+                                        (amp/unscale! scaler optimizer))
+                               (nn/clip-grad-norm! parameters grad-clip))
+                             (amp/step! scaler optimizer)
+                             (t/item-float loss)))]
+                     (swap! global-step inc)
+                     loss-value)))
+               batches)
+              mean-loss (/ (reduce + 0.0 losses) (double (count losses)))
+              metrics (validate tabicl x-train y-train x-validation y-validation
+                                classification? options)
+              improved? (if maximize?
+                          (> (:primary metrics) @best-metric)
+                          (< (:primary metrics) @best-metric))]
+          (swap! history conj (assoc metrics
+                                     :epoch (inc epoch)
+                                     :train-loss mean-loss
+                                     :learning-rate (first (optim/learning-rates optimizer))))
+          (if improved?
+            (do
+              (t/release! @best-state)
+              (reset! best-state (nn/clone-flat-state-dict tabicl))
+              (reset! best-metric (:primary metrics))
+              (reset! patience-counter 0))
+            (swap! patience-counter inc))
+          (recur (inc epoch)))))
     (nn/load-flat-state-dict! tabicl @best-state)
     (t/release! @best-state)
     {:model tabicl
