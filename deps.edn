@@ -1,7 +1,7 @@
 {:paths ["src"]
  :deps {io.github.antlobach/clorch
         {:git/url "https://github.com/antlobach/clorch.git"
-         :git/sha "388034a380f759194c46c1bb5de333019ba4ad60"}}
+         :git/sha "f09654e3ecd50fae0356d4f70d09cd85b89dab3b"}}
  :aliases {:dev {:extra-paths ["test"]
                  :extra-deps {nrepl/nrepl {:mvn/version "1.1.1"}}
                  :override-deps
