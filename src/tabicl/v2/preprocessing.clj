@@ -70,6 +70,30 @@
 (defn- power-transform [rows lambdas]
   (mapv #(mapv yeo-johnson % lambdas) rows))
 
+(defn- population-scale-step [columns]
+  (fn [{:metamorph/keys [data id mode] :as context}]
+    (case mode
+      :fit
+      (let [row-count (tc/row-count data)
+            factor (if (> row-count 1)
+                     (Math/sqrt (/ (double row-count) (dec row-count)))
+                     1.0)
+            corrected (mapv (fn [row]
+                              (mapv #(max -100.0 (min 100.0 (* factor (double %))))
+                                    row))
+                            (dataset->rows data))]
+        (assoc context
+               id {:factor factor}
+               :metamorph/data (rows->dataset corrected columns)))
+
+      :transform
+      (let [factor (get-in context [id :factor])
+            corrected (mapv (fn [row]
+                              (mapv #(max -100.0 (min 100.0 (* factor (double %))))
+                                    row))
+                            (dataset->rows data))]
+        (assoc context :metamorph/data (rows->dataset corrected columns))))))
+
 (defn- power-step [enabled? columns]
   (fn [{:metamorph/keys [data id mode] :as context}]
     (if-not enabled?
@@ -145,6 +169,7 @@
   (let [columns (vec (range (count (first rows))))
         pipeline (mm/pipeline
                   (preprocessing/std-scale columns {})
+                  (population-scale-step columns)
                   (power-step (= method :power) columns)
                   (outlier-step outlier-threshold columns))
         fitted-context (pipeline {:metamorph/data (rows->dataset rows columns)
