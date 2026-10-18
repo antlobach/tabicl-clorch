@@ -34,10 +34,11 @@
     (init/zeros! (get parameters "feedforward[3].bias"))
     block))
 
-(defn- rope-frequencies [head-dim sequence-length]
+(defn- rope-frequencies [head-dim sequence-length device]
   (let [[cosines sines]
         (t/precompute-rope-freqs
-         head-dim sequence-length :theta 100000.0 :interleaved? true)]
+         head-dim sequence-length :theta 100000.0 :interleaved? true
+         :device device)]
     {:cos cosines :sin sines :interleaved? true}))
 
 (defn- initialized-label-weight [max-classes model-dim]
@@ -135,7 +136,10 @@
                                                 (+ cls-count feature-count)])
                                      [flattened-batch 1 1
                                       (+ cls-count feature-count)])))
-                 rope (rope-frequencies (quot dim head-count) (+ cls-count feature-count))
+                 rope (rope-frequencies
+                       (quot dim head-count)
+                       (+ cls-count feature-count)
+                       (.device ^org.bytedeco.pytorch.Tensor (t/->tensor tokens)))
                  prefix-blocks (butlast blocks)
                  encoded (reduce (fn [state block]
                                    (nn/forward block {:x state
