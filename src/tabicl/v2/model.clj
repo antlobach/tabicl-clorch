@@ -1,6 +1,7 @@
 (ns tabicl.v2.model
   "Checkpoint-compatible TabICLv2 classifier and quantile regressor."
-  (:require [clojure.set :as set]
+  (:require [clojure.data.json :as json]
+            [clojure.set :as set]
             [clojure.string :as str]
             [clorch.nn :as nn]
             [clorch.nn.functional :as F]
@@ -502,3 +503,50 @@
                        :unexpected (sort unexpected)})))
     (nn/load-flat-state-dict! model values)
     model))
+
+(def ^:private checkpoint-config-keys
+  {:max-classes :max-classes
+   :num-quantiles :num-quantiles
+   :embed-dim :embed-dim
+   :col-num-blocks :column-blocks
+   :col-nhead :column-heads
+   :col-num-inds :column-inducing-points
+   :col-affine :column-affine?
+   :col-feature-group :feature-group
+   :col-feature-group-size :feature-group-size
+   :col-target-aware :target-aware?
+   :col-ssmax :column-ssmax
+   :row-num-blocks :row-blocks
+   :row-nhead :row-heads
+   :row-num-cls :class-tokens
+   :row-rope-base :rope-base
+   :row-rope-interleaved :rope-interleaved?
+   :icl-num-blocks :icl-blocks
+   :icl-nhead :icl-heads
+   :icl-ssmax :icl-ssmax
+   :ff-factor :feedforward-factor
+   :dropout :dropout
+   :norm-first :norm-first?
+   :bias-free-ln :bias-free-layernorm?})
+
+(defn- converted-config [path]
+  (let [raw (json/read-str (slurp path) :key-fn #(keyword (str/replace % "_" "-")))]
+    (reduce-kv (fn [config source-key destination-key]
+                 (if-some [value (get raw source-key)]
+                   (assoc config destination-key
+                          (if (and (#{:feature-group :column-ssmax :icl-ssmax}
+                                    destination-key)
+                                   (string? value))
+                            (keyword value)
+                            value))
+                   config))
+               {}
+               checkpoint-config-keys)))
+
+(defn load-converted-model
+  "Constructs and strict-loads a converted checkpoint.
+  The converter writes the required JSON configuration beside the SafeTensors file."
+  [safetensors-path]
+  (let [config-path (str/replace (str safetensors-path) #"\.[^.]+$" ".json")
+        model (tabicl-v2 (converted-config config-path))]
+    (load-checkpoint! model safetensors-path)))
