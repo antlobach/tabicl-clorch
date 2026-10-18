@@ -224,9 +224,8 @@
                                          temperature)
                                   -1)]
                (tensor-matrix probabilities))
-             (let [median-index (quot (last (t/size output)) 2)
-                   medians (t/mean (t/ix output :_ :_ median-index) 0)]
-               (mapv #(+ center (* scale (t/item-float %))) (t/tseq medians)))))))
+             (let [means (t/mean (t/mean output -1) 0)]
+               (mapv #(+ center (* scale (t/item-float %))) (t/tseq means)))))))
       (finally
         (nn/train tabicl true)))))
 
