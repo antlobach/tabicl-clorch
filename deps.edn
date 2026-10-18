@@ -1,11 +1,12 @@
 {:paths ["src"]
  :deps {io.github.antlobach/clorch
         {:git/url "https://github.com/antlobach/clorch.git"
-         :git/sha "388034a380f759194c46c1bb5de333019ba4ad60"}}
+         :git/sha "776e64b2be3342945392d2a50d7a3efe0f359670"}
+        org.scicloj/noj {:mvn/version "2-beta24"}}
  :aliases {:dev {:extra-paths ["test"]
                  :extra-deps {nrepl/nrepl {:mvn/version "1.1.1"}}
                  :override-deps
                  {io.github.antlobach/clorch {:local/root "../clorch"}
-                  org.bytedeco/pytorch-platform {:mvn/version "2.7.1-1.5.12"}
-                  org.bytedeco/pytorch-platform-gpu {:mvn/version "2.7.1-1.5.12"}}
+                  org.bytedeco/pytorch-platform {:mvn/version "2.10.0-1.5.13"}
+                  org.bytedeco/pytorch-platform-gpu {:mvn/version "2.10.0-1.5.13"}}
                  :main-opts ["-m" "nrepl.cmdline" "--bind" "127.0.0.1" "--port" "7893"]}}}

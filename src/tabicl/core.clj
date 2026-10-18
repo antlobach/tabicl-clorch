@@ -4,33 +4,42 @@
   This matches the official Hugging Face TabICLv1 checkpoint architecture and can
   load its converted weights. Estimator-level preprocessing and ensembling remain
   separate from this model."
-  (:require [clojure.data.json :as json]
-            [clojure.set :as set]
+  (:require [clojure.set :as set]
             [clojure.string :as str]
             [clorch.nn :as nn]
-            [clorch.nn.functional :as F]
             [clorch.nn.init :as init]
-            [clorch.torch :as t])
-  (:import [java.io RandomAccessFile]
-           [java.nio ByteBuffer ByteOrder FloatBuffer]
-           [java.nio.channels FileChannel]
-           [java.nio.charset StandardCharsets]))
+            [clorch.safetensors :as safetensors]
+            [clorch.torch :as t]))
 
 (set! *warn-on-reflection* true)
 
-(defn- initialized-linear [in-features out-features zero-init?]
-  (let [linear (nn/linear in-features out-features)]
-    (when zero-init?
-      (doseq [tensor (vals (nn/named-parameters linear))]
-        (init/zeros! tensor)))
-    linear))
+(defn- initialized-transformer-block
+  [model-dim heads feedforward-dim dropout-probability]
+  (let [block (nn/transformer-encoder-layer
+               model-dim heads
+               :feedforward-dim feedforward-dim
+               :dropout dropout-probability
+               :activation :gelu
+               :norm-first? true)
+        parameters (nn/named-parameters block)]
+    (doseq [projection (t/chunk
+                        (get parameters "attention.in-projection.weight")
+                        3
+                        0)]
+      (init/xavier-uniform! projection (/ 1.0 (Math/sqrt 2.0))))
+    (init/zeros! (get parameters "attention.in-projection.bias"))
+    (init/zeros! (get parameters "attention.out-projection.weight"))
+    (init/zeros! (get parameters "attention.out-projection.bias"))
+    (init/zeros! (get parameters "feedforward[3].weight"))
+    (init/zeros! (get parameters "feedforward[3].bias"))
+    block))
 
-(defn- initialized-attention-projection [model-dim]
-  (let [linear (nn/linear model-dim model-dim)
-        parameters (nn/named-parameters linear)]
-    (init/xavier-uniform! (get parameters "weight") (/ 1.0 (Math/sqrt 2.0)))
-    (init/zeros! (get parameters "bias"))
-    linear))
+(defn- rope-frequencies [head-dim sequence-length device]
+  (let [[cosines sines]
+        (t/precompute-rope-freqs
+         head-dim sequence-length :theta 100000.0 :interleaved? true
+         :device device)]
+    {:cos cosines :sin sines :interleaved? true}))
 
 (defn- initialized-label-weight [max-classes model-dim]
   (let [weight (t/empty [model-dim max-classes])
@@ -44,126 +53,15 @@
     (init/uniform! bias (- bound) bound)
     (nn/parameter bias)))
 
-(defn- rope-frequencies [head-dim sequence-length]
-  (let [exponents (t/div (t/arange 0 head-dim 2) (double head-dim))
-        inverse-frequencies (t/pow 100000.0 (t/mul exponents -1.0))
-        angles (t/outer (t/arange sequence-length) inverse-frequencies)
-        interleaved-angles (t/repeat-interleave angles 2 -1)]
-    [(t/cos interleaved-angles) (t/sin interleaved-angles)]))
-
-(defn- apply-interleaved-rope [x [cosines sines]]
-  (let [[batch-size sequence-length heads head-dim] (t/size x)
-        half-dim (quot head-dim 2)
-        pairs (t/reshape x [batch-size sequence-length heads half-dim 2])
-        [even odd] (t/unbind pairs -1)
-        rotated (t/reshape (t/stack [(t/mul odd -1.0) even] -1)
-                           [batch-size sequence-length heads head-dim])
-        cosines (t/reshape (t/ix cosines [0 sequence-length] :_)
-                           [1 sequence-length 1 head-dim])
-        sines (t/reshape (t/ix sines [0 sequence-length] :_)
-                         [1 sequence-length 1 head-dim])]
-    (t/add (t/mul x cosines) (t/mul rotated sines))))
-
-#_{:clj-kondo/ignore [:unresolved-symbol]}
-(nn/defmodel MultiHeadAttention [model-dim heads dropout-probability]
-  [q-projection (initialized-attention-projection model-dim)
-   k-projection (initialized-attention-projection model-dim)
-   v-projection (initialized-attention-projection model-dim)
-   out-projection (initialized-linear model-dim model-dim true)
-   head-count heads
-   head-dim (quot model-dim heads)
-   dropout-p dropout-probability]
-  (forward [input]
-           (let [query (:query input)
-                 attention-key (or (:key input) query)
-                 value (or (:value input) attention-key)
-                 rope (:rope input)
-                 attention-mask (:attention-mask input)
-                 cached-key (:cached-key input)
-                 cached-value (:cached-value input)
-                 need-kv? (:need-kv? input)
-                 [batch-size query-length _] (t/size query)
-                 key-length (if cached-key
-                              (nth (t/size cached-key) 2)
-                              (second (t/size attention-key)))
-                 q (t/reshape (nn/forward q-projection query)
-                              [batch-size query-length head-count head-dim])
-                 k (when-not cached-key
-                     (t/reshape (nn/forward k-projection attention-key)
-                                [batch-size key-length head-count head-dim]))
-                 v (when-not cached-value
-                     (t/reshape (nn/forward v-projection value)
-                                [batch-size key-length head-count head-dim]))
-                 q (if rope (apply-interleaved-rope q rope) q)
-                 k (if (and rope k) (apply-interleaved-rope k rope) k)
-                 q (t/transpose q 1 2)
-                 k (or cached-key (t/transpose k 1 2))
-                 v (or cached-value (t/transpose v 1 2))
-                 attended (F/scaled-dot-product-attention q k v
-                                                          :attention-mask attention-mask
-                                                          :dropout-p dropout-p)
-                 merged (t/reshape (t/transpose attended 1 2)
-                                   [batch-size query-length (* head-count head-dim)])
-                 output (nn/forward out-projection merged)]
-             (if need-kv?
-               {:output output :key k :value v}
-               output))))
-
-#_{:clj-kondo/ignore [:unresolved-symbol]}
-(nn/defmodel TransformerBlock [model-dim heads feedforward-dim dropout-probability]
-  [attention (MultiHeadAttention model-dim heads dropout-probability)
-   norm1 (nn/layernorm model-dim)
-   norm2 (nn/layernorm model-dim)
-   feedforward [(nn/linear model-dim feedforward-dim)
-                (nn/gelu)
-                (nn/dropout dropout-probability)
-                (initialized-linear feedforward-dim model-dim true)]
-   dropout (nn/dropout dropout-probability)]
-  (forward [input]
-           (let [input (if (map? input) input {:query input})
-                 query (:query input)
-                 attention-key (:key input)
-                 value (:value input)
-                 rope (:rope input)
-                 attention-mask (:attention-mask input)
-                 cached-key (:cached-key input)
-                 cached-value (:cached-value input)
-                 need-kv? (:need-kv? input)
-                 normalized-query (nn/forward norm1 query)
-                 normalized-key (when-not cached-key
-                                  (if attention-key
-                                    (nn/forward norm1 attention-key)
-                                    normalized-query))
-                 normalized-value (when-not cached-value
-                                    (if value
-                                      (nn/forward norm1 value)
-                                      normalized-key))
-                 attention-result (nn/forward attention
-                                              {:query normalized-query
-                                               :key normalized-key
-                                               :value normalized-value
-                                               :rope rope
-                                               :attention-mask attention-mask
-                                               :cached-key cached-key
-                                               :cached-value cached-value
-                                               :need-kv? need-kv?})
-                 attended (if need-kv? (:output attention-result) attention-result)
-                 residual (t/add query (nn/forward dropout attended))
-                 output (t/add residual
-                               (nn/forward dropout
-                                           (nn/forward feedforward
-                                                       (nn/forward norm2 residual))))]
-             (if need-kv?
-               (assoc attention-result :output output)
-               output))))
-
 #_{:clj-kondo/ignore [:unresolved-symbol]}
 (nn/defmodel InducedAttentionBlock [model-dim heads feedforward-dim inducing-count dropout-probability]
   [inducing-points (let [parameter (nn/parameter (t/empty [inducing-count model-dim]))]
                      (init/trunc-normal! (:tensor parameter) :std 0.02)
                      parameter)
-   inducing-attention (TransformerBlock model-dim heads feedforward-dim dropout-probability)
-   input-attention (TransformerBlock model-dim heads feedforward-dim dropout-probability)
+   inducing-attention (initialized-transformer-block
+                       model-dim heads feedforward-dim dropout-probability)
+   input-attention (initialized-transformer-block
+                    model-dim heads feedforward-dim dropout-probability)
    num-inducing inducing-count
    dim model-dim]
   (forward [input]
@@ -173,8 +71,8 @@
                                     [batch-size num-inducing dim])
                  context (if train-size (t/ix x :_ [0 train-size] :_) x)
                  hidden (nn/forward inducing-attention
-                                    {:query inducing :key context :value context})]
-             (nn/forward input-attention {:query x :key hidden :value hidden}))))
+                                    {:x inducing :key context :value context})]
+             (nn/forward input-attention {:x x :key hidden :value hidden}))))
 
 (defn- run-blocks [blocks input]
   (reduce (fn [x block]
@@ -213,8 +111,8 @@
                   (init/trunc-normal! (:tensor parameter) :std 0.02)
                   parameter)
    blocks (vec (repeatedly block-count
-                           #(TransformerBlock model-dim heads feedforward-dim
-                                              dropout-probability)))
+                           #(initialized-transformer-block
+                             model-dim heads feedforward-dim dropout-probability)))
    output-norm (nn/layernorm model-dim)
    cls-count class-token-count
    dim model-dim
@@ -238,16 +136,19 @@
                                                 (+ cls-count feature-count)])
                                      [flattened-batch 1 1
                                       (+ cls-count feature-count)])))
-                 rope (rope-frequencies (quot dim head-count) (+ cls-count feature-count))
+                 rope (rope-frequencies
+                       (quot dim head-count)
+                       (+ cls-count feature-count)
+                       (.device ^org.bytedeco.pytorch.Tensor (t/->tensor tokens)))
                  prefix-blocks (butlast blocks)
                  encoded (reduce (fn [state block]
-                                   (nn/forward block {:query state
+                                   (nn/forward block {:x state
                                                       :rope rope
                                                       :attention-mask attention-mask}))
                                  tokens
                                  prefix-blocks)
                  cls-output (nn/forward (last blocks)
-                                        {:query (t/ix encoded :_ [0 cls-count] :_)
+                                        {:x (t/ix encoded :_ [0 cls-count] :_)
                                          :key encoded
                                          :value encoded
                                          :rope rope
@@ -261,8 +162,8 @@
   [label-embeddings (initialized-label-weight max-classes model-dim)
    label-bias (initialized-label-bias max-classes model-dim)
    blocks (vec (repeatedly block-count
-                           #(TransformerBlock model-dim heads feedforward-dim
-                                              dropout-probability)))
+                           #(initialized-transformer-block
+                             model-dim heads feedforward-dim dropout-probability)))
    output-norm (nn/layernorm model-dim)
    decoder [(nn/linear model-dim (* 2 model-dim))
             (nn/gelu)
@@ -282,7 +183,7 @@
                  source (t/cat [training-rows (t/ix rows :_ [train-size sample-count] :_)] 1)
                  encoded (reduce (fn [state block]
                                    (let [context (t/ix state :_ [0 train-size] :_)]
-                                     (nn/forward block {:query state
+                                     (nn/forward block {:x state
                                                         :key context
                                                         :value context})))
                                  source
@@ -356,11 +257,11 @@
                                   (t/unsqueeze (:tensor (:inducing-points block)) 0)
                                   [batch-size (:num-inducing block) (:dim block)])
                         block-hidden (nn/forward (:inducing-attention block)
-                                                 {:query inducing
+                                                 {:x inducing
                                                   :key state
                                                   :value state})
                         output (nn/forward (:input-attention block)
-                                           {:query state
+                                           {:x state
                                             :key block-hidden
                                             :value block-hidden})]
                     [output (conj hidden block-hidden)]))
@@ -374,7 +275,7 @@
   (let [{:keys [state] :as input} (column-input column-embedding x-test)
         state (reduce (fn [state [block block-hidden]]
                         (nn/forward (:input-attention block)
-                                    {:query state
+                                    {:x state
                                      :key block-hidden
                                      :value block-hidden}))
                       state
@@ -396,7 +297,7 @@
   (let [source (add-labels icl training-rows y-train)
         [state entries]
         (reduce (fn [[state entries] block]
-                  (let [result (nn/forward block {:query state :need-kv? true})]
+                  (let [result (nn/forward block {:x state :return-kv? true})]
                     [(:output result)
                      (conj entries {:key (:key result) :value (:value result)})]))
                 [source []]
@@ -423,7 +324,7 @@
         rows (nn/forward (:row-interaction model) columns)
         icl (:icl model)
         state (reduce (fn [state [block entry]]
-                        (nn/forward block {:query state
+                        (nn/forward block {:x state
                                            :cached-key (:key entry)
                                            :cached-value (:value entry)}))
                       rows
@@ -445,63 +346,14 @@
    :max-classes 10
    :dropout 0.0})
 
-(defn- read-fully!
-  [^FileChannel channel ^ByteBuffer buffer position]
-  (loop [offset (long position)]
-    (when (.hasRemaining buffer)
-      (let [read-count (.read channel buffer offset)]
-        (when (neg? read-count)
-          (throw (ex-info "Unexpected end of safetensors archive"
-                          {:position offset})))
-        (recur (+ offset read-count)))))
-  (.flip buffer))
-
-(defn- safetensors-header
-  [^FileChannel channel]
-  (let [length-buffer (doto (ByteBuffer/allocate 8)
-                        (.order ByteOrder/LITTLE_ENDIAN))]
-    (read-fully! channel length-buffer 0)
-    (let [header-length (.getLong length-buffer)
-          header-buffer (ByteBuffer/allocate (Math/toIntExact header-length))]
-      (read-fully! channel header-buffer 8)
-      {:data-start (+ 8 header-length)
-       :entries (json/read-str
-                 (String. (.array header-buffer) StandardCharsets/UTF_8))})))
-
-(defn- read-safe-tensor
-  [^FileChannel channel data-start {:strs [dtype shape data_offsets]}]
-  (when-not (= "F32" dtype)
-    (throw (ex-info "TabICLv1 checkpoint contains an unsupported dtype"
-                    {:dtype dtype})))
-  (let [[start end] data_offsets
-        byte-count (- end start)
-        buffer (doto (ByteBuffer/allocate (Math/toIntExact byte-count))
-                 (.order ByteOrder/LITTLE_ENDIAN))
-        data (float-array (quot byte-count Float/BYTES))]
-    (read-fully! channel buffer (+ data-start start))
-    (.get ^FloatBuffer (.asFloatBuffer buffer) data)
-    (t/reshape (t/tensor data {:dtype :float32}) shape)))
-
-(defn- split-projection
-  [destination-prefix suffix tensor]
-  (let [model-dim (quot (first (t/size tensor)) 3)]
-    (into {}
-          (map-indexed
-           (fn [index projection]
-             [(str destination-prefix ".attention." projection "." suffix)
-              (if (= "weight" suffix)
-                (t/ix tensor [(* index model-dim) (* (inc index) model-dim)] :_)
-                (t/ix tensor [(* index model-dim) (* (inc index) model-dim)]))])
-           ["q-projection" "k-projection" "v-projection"]))))
-
 (defn- block-destinations
   [destination-prefix tail tensor]
   (cond
     (= tail "attn.in_proj_weight")
-    (split-projection destination-prefix "weight" tensor)
+    {(str destination-prefix ".attention.in-projection.weight") tensor}
 
     (= tail "attn.in_proj_bias")
-    (split-projection destination-prefix "bias" tensor)
+    {(str destination-prefix ".attention.in-projection.bias") tensor}
 
     (str/starts-with? tail "attn.out_proj.")
     {(str destination-prefix ".attention.out-projection."
@@ -587,22 +439,20 @@
 (defn load-checkpoint!
   "Loads a safetensors archive containing the official TabICLv1 state dict."
   [model path]
-  (let [values (atom {})]
-    (with-open [file (RandomAccessFile. (str path) "r")
-                channel (.getChannel file)]
-      (let [{:keys [data-start entries]} (safetensors-header channel)]
-        (doseq [[source-name entry] (dissoc entries "__metadata__")]
-          (let [source (read-safe-tensor channel data-start entry)]
-            (swap! values into (checkpoint-destinations source-name source))))))
+  (let [source-state (safetensors/load-file path)
+        values (into {}
+                     (mapcat (fn [[source-name source]]
+                               (checkpoint-destinations source-name source)))
+                     source-state)]
     (let [expected (nn/flat-parameter-names model)
-          supplied (set (keys @values))
+          supplied (set (keys values))
           missing (set/difference expected supplied)
           unexpected (set/difference supplied expected)]
       (when (or (seq missing) (seq unexpected))
         (throw (ex-info "Checkpoint and model parameters differ"
                         {:missing (sort missing)
                          :unexpected (sort unexpected)})))
-      (let [loaded (nn/load-flat-state-dict! model @values)]
+      (let [loaded (nn/load-flat-state-dict! model values)]
         (when-not (= supplied loaded)
           (throw (ex-info "Checkpoint loading was incomplete"
                           {:not-loaded (sort (set/difference supplied loaded))})))))
