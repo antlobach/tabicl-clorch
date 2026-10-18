@@ -1,14 +1,14 @@
 (ns tabicl.examples.finetune-regressor
-  (:require [clojure.edn :as edn]
+  (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clorch.nn :as nn]
             [tabicl.v2.finetune :as finetune]
             [tabicl.v2.model :as v2]))
 
 (defn- tutorial-data []
-  (edn/read-string (slurp (io/resource "tabicl/examples/finetune_regressor_data.edn"))))
+  (json/read-str (slurp (io/resource "tabicl/examples/finetune_regressor_data.json"))))
 
-(defn run!
+(defn execute!
   "Replicates the official TabICLv2 regressor fine-tuning tutorial on CUDA."
   [checkpoint]
   (let [data (tutorial-data)
@@ -43,5 +43,5 @@
   (when-not checkpoint
     (throw (IllegalArgumentException.
             "Pass the converted TabICLv2 regressor .safetensors path")))
-  (println (run! checkpoint))
+  (println (execute! checkpoint))
   (shutdown-agents))
