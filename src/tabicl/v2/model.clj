@@ -206,7 +206,7 @@
 (defn attention-block-forward [block input]
   (let [{:keys [query key value train-size] :as input}
         (if (map? input) input {:query input})
-        key (or key (if train-size (t/ix query :_ [0 train-size] :_) query))
+        key (or key (if train-size (t/slice query -2 0 train-size 1) query))
         value (or value key)]
     (if (:norm-first? block)
       (let [query-normalized (nn/forward (:norm1 block) query)
@@ -244,7 +244,7 @@
                  batch-shape (vec (drop-last 2 shape))
                  inducing (t/expand (:tensor inducing-points)
                                     (conj batch-shape inducing-count dimension))
-                 context (if train-size (t/ix source :_ [0 train-size] :_) source)
+                 context (if train-size (t/slice source -2 0 train-size 1) source)
                  hidden (nn/forward attention1 {:query inducing :key context :value context})
                  output (nn/forward attention2 {:query source :key hidden :value hidden})
                  skipped? (-> source (t/eq skip-value) (t/all -1) (t/all -1))
