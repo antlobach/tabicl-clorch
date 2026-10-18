@@ -5,7 +5,6 @@
             [clorch.nn.functional :as F]
             [clorch.optim :as optim]
             [clorch.torch :as t]
-            [tabicl.v2.model :as model]
             [tabicl.v2.preprocessing :as prep])
   (:import [java.util ArrayList Collections Random]))
 
@@ -177,7 +176,7 @@
                        (t/mul (t/sub alpha 1.0) difference)))))
 
 (defn- tensor-matrix [tensor]
-  (let [[rows columns] (t/size tensor)
+  (let [columns (last (t/size tensor))
         values (mapv t/item-float (t/tseq (t/reshape tensor [-1])))]
     (mapv vec (partition columns values))))
 
