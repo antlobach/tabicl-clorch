@@ -42,7 +42,7 @@
         (* 0.5 (+ 1.0 (Math/cos (* Math/PI progress))))))))
 
 (defn- shuffled [values seed]
-  (let [result (ArrayList. values)]
+  (let [result (ArrayList. ^java.util.Collection (vec values))]
     (Collections/shuffle result (Random. (long seed)))
     (vec result)))
 

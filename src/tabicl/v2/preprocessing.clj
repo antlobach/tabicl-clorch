@@ -107,9 +107,9 @@
             (mapv (fn [value center scale lambda lo hi]
                     (let [standardized (clip (/ (- (double value) center) scale)
                                              -100.0 100.0)
-                          normalized (if lambda
-                                       (yeo-johnson standardized lambda)
-                                       standardized)]
+                          normalized (double (if lambda
+                                               (yeo-johnson standardized lambda)
+                                               standardized))]
                       (-> normalized
                           (max (+ lo (- (Math/log1p (Math/abs normalized)))))
                           (min (+ hi (Math/log1p (Math/abs normalized)))))))
