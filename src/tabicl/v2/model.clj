@@ -475,7 +475,7 @@
       (str/replace "attn.ssmax_layer" "ssmax-layer")
       (str/replace "base_mlp" "base-mlp")
       (str/replace "query_mlp" "query-mlp")
-      (str/replace #"\.([02])\." ".[$1].")
+      (str/replace #"\.([02])\." "[$1].")
       (str/replace #"(norm[12]|output-norm)\.weight$" "$1.gamma")
       (str/replace #"(norm[12]|output-norm)\.bias$" "$1.beta")))
 
