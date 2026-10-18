@@ -36,7 +36,7 @@
    :bias-free-layernorm? false})
 
 (defn- linear-sequence [input layers]
-  (reduce nn/forward input layers))
+  (reduce (fn [value layer] (nn/forward layer value)) input layers))
 
 #_{:clj-kondo/ignore [:unresolved-symbol]}
 (nn/defmodel OneHotLinear [class-count output-dim]
@@ -100,7 +100,21 @@
    head-count heads
    dropout (:dropout config)
    norm-first? (:norm-first? config)]
-  (forward [input] (attention-block-forward this input)))
+  (forward [input]
+           (attention-block-forward
+            {:linear1 linear1
+             :linear2 linear2
+             :norm1 norm1
+             :norm2 norm2
+             :in-projection-weight in-projection-weight
+             :in-projection-bias in-projection-bias
+             :out-projection out-projection
+             :ssmax-layer ssmax-layer
+             :dimension dimension
+             :head-count head-count
+             :dropout dropout
+             :norm-first? norm-first?}
+            input)))
 
 (defn- packed-projections [block query key value]
   (let [dimension (:dimension block)
@@ -300,7 +314,14 @@
                                   [(first (t/size features))
                                    (second (t/size features))
                                    (second (t/size y-train))])]
-             (t/transpose (compute-column-embeddings this features labels) 1 2))))
+             (t/transpose
+              (compute-column-embeddings
+               {:input-linear input-linear
+                :blocks blocks
+                :y-encoder y-encoder
+                :max-classes max-classes}
+               features labels)
+              1 2))))
 
 (defn- run-attention-blocks [blocks source options]
   (reduce (fn [state block]
@@ -441,8 +462,7 @@
       (str/replace "multihead_attn1" "attention1")
       (str/replace "multihead_attn2" "attention2")
       (str/replace "ind_vectors" "inducing-points")
-      (str/replace "in_linear.linear" "input-linear.linear")
-      (str/replace "in_linear" "input-linear")
+      (str/replace "in_linear" "input-linear.linear")
       (str/replace "cls_tokens" "class-token-values")
       (str/replace "out_ln" "output-norm")
       (str/replace ".ln." ".output-norm.")
@@ -462,8 +482,17 @@
   "Loads a converted TabICLv2 SafeTensors checkpoint with strict key matching."
   [model path]
   (let [source (safetensors/load-file path)
-        values (into {} (map (fn [[name value]] [(checkpoint-name name) value])) source)
         expected (nn/flat-parameter-names model)
+        values (into {}
+                     (map (fn [[name value]]
+                            (let [mapped (checkpoint-name name)
+                                  mapped (if (contains? expected mapped)
+                                           mapped
+                                           (str/replace mapped
+                                                        ".y-encoder."
+                                                        ".y-encoder.linear."))]
+                              [mapped value])))
+                     source)
         supplied (set (keys values))
         missing (set/difference expected supplied)
         unexpected (set/difference supplied expected)]
