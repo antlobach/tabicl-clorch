@@ -31,7 +31,87 @@ Yeo-Johnson normalization, soft outlier handling, feature/class shuffling, and
 context-only fitting are reused consistently by training, validation, and
 inference.
 
-## Use
+## TabICLv2 quick start
+
+### Download and convert the official weights
+
+The JVM loader reads SafeTensors rather than Python pickle. Download the
+official checkpoints and convert each one once:
+
+```bash
+python -m pip install torch safetensors huggingface_hub
+
+hf download jingang/TabICL tabicl-classifier-v2-20260212.ckpt \
+  --local-dir checkpoints
+hf download jingang/TabICL tabicl-regressor-v2-20260212.ckpt \
+  --local-dir checkpoints
+
+python scripts/convert_v2_checkpoint.py \
+  checkpoints/tabicl-classifier-v2-20260212.ckpt \
+  checkpoints/tabicl-classifier-v2.safetensors
+python scripts/convert_v2_checkpoint.py \
+  checkpoints/tabicl-regressor-v2-20260212.ckpt \
+  checkpoints/tabicl-regressor-v2.safetensors
+```
+
+Each conversion writes a `.safetensors` file and a same-named `.json`
+configuration file. Keep them together. Loading is strict: missing, unexpected,
+or shape-mismatched model parameters raise an exception.
+
+### Classification
+
+`finetune/predict` accepts ordinary JVM row vectors. It fits a Noj/Metamorph
+ensemble on the supplied context rows and returns one probability vector per
+query row:
+
+```clojure
+(require '[clorch.nn :as nn]
+         '[tabicl.v2.finetune :as finetune]
+         '[tabicl.v2.model :as v2])
+
+(def device :cuda)
+(def classifier
+  (nn/to (v2/load-converted-model
+          "checkpoints/tabicl-classifier-v2.safetensors")
+         device))
+
+(def x-context [[0.1 1.2] [0.8 -0.4] [-1.1 0.3] [1.4 0.9]])
+(def y-context [0 1 0 1])
+(def x-query [[0.2 0.7] [-0.9 0.1]])
+
+(finetune/predict classifier
+                  x-context y-context x-query
+                  true
+                  {:device device :n-estimators 2})
+;; => [[p(class-0) p(class-1)]
+;;     [p(class-0) p(class-1)]]
+```
+
+Resolve the application-level device once and keep the loaded model outside
+repeated prediction or training scopes.
+
+### Regression
+
+Load the regressor checkpoint and pass `false` for the classification flag.
+The result contains the ensemble-averaged means of the 999 predicted
+quantiles, transformed back to the target scale:
+
+```clojure
+(def regressor
+  (nn/to (v2/load-converted-model
+          "checkpoints/tabicl-regressor-v2.safetensors")
+         device))
+
+(finetune/predict regressor
+                  [[-1.0] [0.0] [1.0] [2.0]]
+                  [-0.8 0.0 0.9 0.4]
+                  [[0.5] [1.5]]
+                  false
+                  {:device device :n-estimators 2})
+;; => [predicted-mean-0 predicted-mean-1]
+```
+
+## TabICLv1 low-level model
 
 ```clojure
 (require '[clorch.nn :as nn]
@@ -47,27 +127,21 @@ inference.
 ;; => [1 4 10]
 ```
 
-For repeated predictions against the same training table, use `prepare-cache` once and pass its result to `forward-with-cache`.
+For repeated predictions against the same training table, use `prepare-cache`
+once and pass its result to `forward-with-cache`.
 
 ## TabICLv2 fine-tuning
 
-Convert an official checkpoint once:
-
-```bash
-python scripts/convert_v2_checkpoint.py \
-  tabicl-classifier-v2-20260212.ckpt \
-  tabicl-classifier-v2.safetensors
-```
-
-The two executable examples use the exact synthetic datasets and train,
-validation, and test splits from the upstream tutorials:
+The two executable examples load the converted pretrained weights before
+fine-tuning. They use the exact synthetic datasets and train, validation, and
+test splits from the upstream tutorials:
 
 ```bash
 clojure -M -m tabicl.examples.finetune-classifier \
-  tabicl-classifier-v2.safetensors
+  checkpoints/tabicl-classifier-v2.safetensors
 
 clojure -M -m tabicl.examples.finetune-regressor \
-  tabicl-regressor-v2.safetensors
+  checkpoints/tabicl-regressor-v2.safetensors
 ```
 
 Both use AdamW, FP16 autocast and gradient scaling, gradient clipping,
@@ -83,7 +157,8 @@ Start the long-lived nREPL:
 CLOJURE_DISABLE_RLWRAP=1 clojure -M:dev
 ```
 
-The `:dev` alias uses a local `../clorch` checkout and the macOS 13-compatible PyTorch preset used for this port's verification. Normal consumers use the pinned Clorch Git revision.
+The `:dev` alias uses a local `../clorch` checkout. Normal consumers use the
+pinned Clorch Git revision.
 
 ## License
 
