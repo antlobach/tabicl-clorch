@@ -405,8 +405,9 @@
                                        y-embedding)
                                 (t/ix representations :_ [train-size nil] :_)]
                                1)
-                 encoded (run-attention-blocks blocks source {:train-size train-size})]
-             (linear-sequence (nn/forward output-norm encoded) decoder))))
+                 encoded (run-attention-blocks blocks source {:train-size train-size})
+                 output (linear-sequence (nn/forward output-norm encoded) decoder)]
+             (t/ix output :_ [train-size nil] :_))))
 
 #_{:clj-kondo/ignore [:unresolved-symbol]}
 (nn/defmodel TabICLv2 [config]
@@ -434,9 +435,7 @@
 (defn predict
   "Returns query logits for classification or raw quantiles for regression."
   [model x y-train]
-  (let [train-size (second (t/size y-train))
-        output (nn/forward model {:x x :y-train y-train})]
-    (t/ix output :_ [train-size nil] :_)))
+  (nn/forward model {:x x :y-train y-train}))
 
 (defn predict-probabilities
   "Returns query probabilities for a classifier."
