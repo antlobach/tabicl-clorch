@@ -482,7 +482,8 @@
 (defn load-checkpoint!
   "Loads a converted TabICLv2 SafeTensors checkpoint with strict key matching."
   [model path]
-  (let [source (safetensors/load-file path)
+  (let [source (dissoc (safetensors/load-file path)
+                       "row_interactor.tf_row.rope.freqs")
         expected (nn/flat-parameter-names model)
         values (into {}
                      (map (fn [[name value]]
