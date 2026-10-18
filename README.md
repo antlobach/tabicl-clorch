@@ -15,6 +15,10 @@ single-dataset fine-tuning.
 - [TabICL: A Tabular Foundation Model for In-Context Learning on Large Data](https://arxiv.org/abs/2502.05564), ICML 2025
 - [Clorch](https://github.com/antlobach/clorch)
 
+The [API roadmap](docs/roadmap.md) tracks the planned Python-style estimator
+surface, automatic checkpoint handling, fine-tuning API, and deeper
+Noj/Metamorph integration.
+
 TabICL is the work of Jingang Qu, David Holzmüller, Gaël Varoquaux, and Marine Le Morvan. This port is not affiliated with or endorsed by the upstream authors.
 
 ## Scope
